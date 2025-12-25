@@ -9,6 +9,7 @@ from codesage.semantic_digest.go_snapshot_builder import GoSemanticSnapshotBuild
 from codesage.semantic_digest.shell_snapshot_builder import ShellSemanticSnapshotBuilder
 from codesage.semantic_digest.java_snapshot_builder import JavaSemanticSnapshotBuilder
 from codesage.snapshot.models import ProjectSnapshot, Issue, IssueLocation, FileSnapshot, ProjectRiskSummary, ProjectIssuesSummary, SnapshotMetadata, DependencyGraph
+from collections import namedtuple
 from codesage.reporters import ConsoleReporter, JsonReporter, GitHubPRReporter
 from codesage.cli.plugin_loader import PluginManager
 from codesage.history.store import StorageEngine
@@ -18,6 +19,65 @@ from codesage.config.risk_baseline import RiskBaselineConfig
 from codesage.rules.jules_specific_rules import JULES_RULESET
 from codesage.rules.base import RuleContext
 from datetime import datetime, timezone
+
+# Create a simple wrapper class for Dict-based snapshots
+class DictSnapshot:
+    """Wrapper for Dict-based snapshots to make them compatible with ProjectSnapshot."""
+    def __init__(self, data: dict):
+        self.data = data
+    
+    @property
+    def files(self):
+        # Extract files from dict structure
+        return self.data.get("files", [])
+    
+    @property
+    def languages(self):
+        # Extract languages from dict (with backward compatibility)
+        return self.data.get("languages") or ["python"]
+    
+    @property
+    def metadata(self):
+        # Return a simple metadata object
+        class SimpleMetadata:
+            def __init__(self, data):
+                self.file_count = len(data.get("files", []))
+                self.total_size = 0  # Not available in dict
+                self.version = "v1.0"
+                self.timestamp = datetime.now(timezone.utc)
+                self.project_name = "unknown"
+                self.tool_version = "0.2.0"
+                self.config_hash = "unknown"
+                self.git_commit = None
+        
+        return SimpleMetadata(self.data)
+    
+    @property
+    def dependencies(self):
+        # Extract dependencies from dict
+        class SimpleDeps:
+            def __init__(self, data):
+                self.internal = []
+                self.external = data.get("deps", {}).get("imports", []) if isinstance(data.get("deps"), dict) else []
+                self.edges = []
+        
+        return SimpleDeps(self.data)
+    
+    @property
+    def risk_summary(self):
+        return None
+    
+    @property
+    def issues_summary(self):
+        return None
+    
+    @property
+    def llm_stats(self):
+        return None
+    
+    @property
+    def language_stats(self):
+        return {}
 
 def get_builder(language: str, path: Path):
     config = SnapshotConfig()
@@ -46,9 +106,55 @@ def detect_languages(path: Path) -> List[str]:
                 languages.add("shell")
     return list(languages)
 
-def merge_snapshots(snapshots: List[ProjectSnapshot], project_name: str) -> ProjectSnapshot:
+def merge_snapshots(snapshots: List, project_name: str) -> ProjectSnapshot:
     if not snapshots:
         raise ValueError("No snapshots to merge")
+    
+    # Handle single DictSnapshot case - return the first ProjectSnapshot or create a minimal one
+    if len(snapshots) == 1 and isinstance(snapshots[0], DictSnapshot):
+        # For DictSnapshot, we need to create a minimal ProjectSnapshot
+        dict_snap = snapshots[0].data
+        from codesage.snapshot.yaml_generator import YAMLGenerator
+        generator = YAMLGenerator()
+        
+        # Convert dict-based snapshot to ProjectSnapshot structure
+        # This is a minimal conversion for compatibility
+        files_list = []
+        for file_path in dict_snap.get("files", []):
+            files_list.append(FileSnapshot(
+                path=file_path,
+                language="python",
+                size=None,
+                content=None,
+                metrics=None,
+                symbols={},
+                risk=None,
+                issues=[]
+            ))
+        
+        return ProjectSnapshot(
+            metadata=SnapshotMetadata(
+                version="v1.0",
+                timestamp=datetime.now(timezone.utc),
+                project_name=project_name,
+                file_count=len(files_list),
+                total_size=0,
+                tool_version="0.2.0",
+                config_hash="dict-snapshot",
+                git_commit=None
+            ),
+            files=files_list,
+            dependencies=DependencyGraph(
+                internal=[],
+                external=[],
+                edges=[]
+            ),
+            languages=["python"],
+            risk_summary=None,
+            issues_summary=None,
+            llm_stats=None,
+            language_stats={}
+        )
 
     if len(snapshots) == 1:
         return snapshots[0]
@@ -192,9 +298,17 @@ def scan(ctx, path, language, reporter, output, fail_on_high, ci_mode, plugins_d
 
         try:
             s = builder.build()
-            # Manually ensure language list is populated if builder didn't
-            if not s.languages:
-                s.languages = [lang]
+            # Handle both Dict and ProjectSnapshot return types
+            # Some builders (e.g., PythonSemanticSnapshotBuilder) return Dict instead of ProjectSnapshot
+            if isinstance(s, dict):
+                # Wrap Dict in DictSnapshot for compatibility
+                if "languages" not in s:
+                    s["languages"] = [lang]
+                s = DictSnapshot(s)
+            else:
+                # For ProjectSnapshot, ensure language list is populated
+                if not s.languages:
+                    s.languages = [lang]
             snapshots.append(s)
         except Exception as e:
             click.echo(f"Scan failed for {lang}: {e}", err=True)
